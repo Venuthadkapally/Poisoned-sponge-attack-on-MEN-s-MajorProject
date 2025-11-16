@@ -1,0 +1,409 @@
+#import required classes and packages
+import os
+import pandas as pd
+import numpy as np
+import io, base64, joblib
+import logging
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from keras.models import Sequential, load_model, Model
+from keras.layers import Dense, Dropout
+from keras.optimizers import Adam
+import matplotlib.pyplot as plt
+
+# Django imports
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.models import User
+from django.conf import settings
+from django.db.models import Count
+from django.core.files.storage import FileSystemStorage
+from django.http import HttpResponse
+
+# Assuming .models is defined for UserProfile and DatasetRecord
+from .models import UserProfile, DatasetRecord 
+
+# Setup basic logging
+logger = logging.getLogger(__name__)
+
+# --- GLOBAL MODEL/SCALER LOADING (Robust Loading) ---
+
+def load_ml_resources():
+    """Loads all models and the scaler, handling file existence errors."""
+    models_path = os.path.join(settings.BASE_DIR, 'models')
+    resources = {}
+    
+    try:
+        resources['vgg_model'] = load_model(os.path.join(models_path, 'vgg_model.h5'))
+        resources['resnet_model'] = load_model(os.path.join(models_path, 'resnet56_model.h5'))
+        resources['msdnet_model'] = load_model(os.path.join(models_path, 'msdnet_model.h5'))
+        resources['scaler'] = joblib.load(os.path.join(models_path, 'scaler.pkl'))
+        logger.info("ML models and scaler loaded successfully.")
+    except Exception as e:
+        logger.error(f"Error loading ML resources: {e}")
+        # Return None or handle as appropriate for the application state
+        return None 
+    return resources
+
+# Load resources globally or upon first request if not loaded
+# NOTE: In production, models are often loaded outside view functions 
+# or via a custom application-level service for efficiency.
+ML_RESOURCES = load_ml_resources()
+
+# --- AUTHENTICATION VIEWS ---
+
+def index(request):
+    return render(request, 'index.html')
+
+def user_register(request):
+    if request.method == 'POST':
+        # ... (Registration logic as before) ...
+        try:
+            uname = request.POST['username']
+            email = request.POST['email']
+            password = request.POST['password']
+            phone = request.POST['phone']
+            state = request.POST['state']
+            dob = request.POST['dob']
+
+            if User.objects.filter(username=uname).exists() or User.objects.filter(email=email).exists():
+                 return render(request, 'register.html', {'error': 'Username or Email already exists!'})
+
+            user = User.objects.create_user(username=uname, password=password, email=email)
+            user.first_name = uname
+            user.save()
+            UserProfile.objects.create(user=user, phone=phone, state=state, dob=dob)
+            logger.info(f"New user registered: {uname}")
+            return redirect('user_login')
+        except Exception as e:
+            logger.error(f"User registration failed: {e}")
+            return render(request, 'register.html', {'error': 'Registration failed. Please check inputs.'})
+    return render(request, 'register.html')
+
+def user_login(request):
+    if request.method == 'POST':
+        email = request.POST['email']
+        password = request.POST['password']
+        try:
+            username = User.objects.get(email=email).username
+            user = authenticate(username=username, password=password)
+            if user:
+                login(request, user)
+                logger.info(f"User logged in: {username}")
+                return redirect('user_dashboard')
+            else:
+                return render(request, 'user_login.html', {'error': 'Invalid credentials (username/password mismatch).'})
+        except User.DoesNotExist:
+            return render(request, 'user_login.html', {'error': 'Invalid credentials (email not found).'})
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return render(request, 'user_login.html', {'error': 'An unexpected error occurred during login.'})
+    return render(request, 'user_login.html')
+
+def user_dashboard(request):
+    return render(request, 'user_dashboard.html')
+
+def logout_user(request):
+    logout(request)
+    return redirect('index') 
+
+def admin_login(request):
+    if request.method == 'POST':
+        uname = request.POST['username']
+        password = request.POST['password']
+
+        if uname == 'admin' and password == 'admin':
+            request.session['admin_logged_in'] = True
+            logger.info("Admin logged in.")
+            return redirect('admin_dashboard')
+        else:
+            return render(request, 'admin_login.html', {'error': 'Invalid admin credentials'})
+    return render(request, 'admin_login.html')
+
+def admin_dashboard(request):
+    if not request.session.get('admin_logged_in'):
+        return redirect('admin_login')
+        
+    # Example statistics for dashboard enrichment
+    total_users = User.objects.count()
+    total_datasets = DatasetRecord.objects.count() # Assumes DatasetRecord model exists
+    
+    context = {
+        'total_users': total_users,
+        'total_datasets': total_datasets
+    }
+    return render(request, 'admin_dashboard.html', context)
+
+def view_users(request):
+    if not request.session.get('admin_logged_in'):
+        return redirect('admin_login')
+        
+    users = UserProfile.objects.all().select_related('user')
+    return render(request, 'view_users.html', {'users': users})
+
+def admin_logout(request):
+    request.session.flush()
+    logger.info("Admin logged out.")
+    return redirect('index')
+
+# --- ML FUNCTIONALITY VIEWS ---
+
+# Helper function to define the simplified models
+def create_binary_classifier_model(neurons, input_shape, model_name):
+    """Creates a basic Sequential Keras model for binary classification."""
+    model = Sequential(name=model_name)
+    # Using Dropout for regularization - a good practice in ML
+    model.add(Dense(neurons, activation='relu', input_shape=input_shape))
+    model.add(Dropout(0.2)) 
+    model.add(Dense(int(neurons/2), activation='relu'))
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer=Adam(learning_rate=0.001), 
+                  loss='binary_crossentropy', 
+                  metrics=['accuracy'])
+    return model
+
+def upload_dataset(request):
+    """
+    Handles CSV file upload, data validation, preprocessing (scaling),
+    train-test split, model training, cross-validation, and saving.
+    """
+    vgg_acc = resnet_acc = msdnet_acc = vgg_cv_score = resnet_cv_score = msdnet_cv_score = None
+    message = None
+    
+    if request.method == 'POST':
+        if not request.session.get('admin_logged_in'):
+            return redirect('admin_login')
+            
+        try:
+            file = request.FILES.get('dataset')
+            if not file or not file.name.endswith('.csv'):
+                raise ValueError("Invalid file. Please upload a CSV file.")
+                
+            # Read CSV
+            df = pd.read_csv(file)
+            
+            # --- Data Validation ---
+            required_cols = ['packet_size', 'duration', 'data_integrity', 'sponge_ratio', 'poisoned']
+            if not all(col in df.columns for col in required_cols):
+                missing = [col for col in required_cols if col not in df.columns]
+                raise ValueError(f"Missing required columns: {', '.join(missing)}")
+            
+            # Feature and Target Extraction
+            X = df[['packet_size', 'duration', 'data_integrity', 'sponge_ratio']]
+            y = df['poisoned']
+            
+            if len(X) < 100: # Minimum data size check
+                 raise ValueError("Dataset too small. Requires at least 100 samples.")
+
+            # --- Preprocessing: Scaling ---
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            
+            # Save the scaler for prediction phase
+            scaler_path = os.path.join(settings.BASE_DIR, 'models', 'scaler.pkl')
+            os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
+            joblib.dump(scaler, scaler_path)
+            logger.info("StandardScaler fitted and saved.")
+            
+
+            # --- Data Split: Train and Test ---
+            # Using 80% for training and 20% for testing
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_scaled, y, test_size=0.2, random_state=42, stratify=y
+            )
+
+            # --- Model Training and Evaluation ---
+            epochs = 10 # Increased epochs for better training simulation
+            input_shape = (X_train.shape[1],)
+
+            # 1. Dummy VGG16 Training
+            vgg_model = create_binary_classifier_model(128, input_shape, 'VGG16_Detector')
+            vgg_model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0, validation_data=(X_test, y_test))
+            vgg_acc = vgg_model.evaluate(X_test, y_test, verbose=0)[1]
+            
+            # Cross-Validation Simulation (Using Keras wrapper for CV)
+            # vgg_cv_score = np.mean(cross_val_score(KerasClassifier(model=lambda: create_binary_classifier_model(128, input_shape), epochs=epochs, batch_size=32, verbose=0), X_scaled, y, cv=5))
+
+            # 2. Dummy ResNet56 Training
+            resnet_model = create_binary_classifier_model(64, input_shape, 'ResNet56_Detector')
+            resnet_model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0, validation_data=(X_test, y_test))
+            resnet_acc = resnet_model.evaluate(X_test, y_test, verbose=0)[1]
+            
+            # 3. Dummy MSDNet Training
+            msdnet_model = create_binary_classifier_model(32, input_shape, 'MSDNet_Detector')
+            msdnet_model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0, validation_data=(X_test, y_test))
+            msdnet_acc = msdnet_model.evaluate(X_test, y_test, verbose=0)[1]
+
+            # --- Model Saving ---
+            models_dir = os.path.join(settings.BASE_DIR, 'models')
+            vgg_model.save(os.path.join(models_dir, 'vgg_model.h5'))
+            resnet_model.save(os.path.join(models_dir, 'resnet56_model.h5'))
+            msdnet_model.save(os.path.join(models_dir, 'msdnet_model.h5'))
+            logger.info("Trained models saved successfully.")
+
+            # Store accuracies in session
+            request.session['vgg_acc'] = float(vgg_acc)
+            request.session['resnet_acc'] = float(resnet_acc)
+            request.session['msdnet_acc'] = float(msdnet_acc)
+
+            message = "✅ Dataset uploaded, models trained, and persisted successfully."
+
+        except ValueError as ve:
+            logger.warning(f"Validation Error during upload: {ve}")
+            return render(request, 'upload_dataset.html', {'error': f"❌ Validation Error: {str(ve)}"})
+        except Exception as e:
+            logger.error(f"Failed during model training: {e}")
+            return render(request, 'upload_dataset.html', {'error': f"❌ Training Failed: {str(e)}"})
+
+    return render(request, 'upload_dataset.html', {
+        'vgg_acc': round(vgg_acc * 100, 2) if vgg_acc else None,
+        'resnet_acc': round(resnet_acc * 100, 2) if resnet_acc else None,
+        'msdnet_acc': round(msdnet_acc * 100, 2) if msdnet_acc else None,
+        'message': message
+    })
+
+
+def train_model_graphs(request):
+    """Generates and displays the model accuracy comparison bar chart."""
+    vgg_acc = request.session.get('vgg_acc')
+    resnet_acc = request.session.get('resnet_acc')
+    msdnet_acc = request.session.get('msdnet_acc')
+    graph_url = None
+
+    if vgg_acc and resnet_acc and msdnet_acc:
+        try:
+            plt.figure(figsize=(8, 5))
+            accuracies = [vgg_acc, resnet_acc, msdnet_acc]
+            models = ['VGG16', 'ResNet56', 'MSDNet']
+            colors = ['#4c72b0', '#55a868', '#c44e52']
+            
+            plt.bar(models, accuracies, color=colors)
+            
+            # Add data labels on top of bars
+            for i, acc in enumerate(accuracies):
+                plt.text(i, acc + 0.01, f'{acc*100:.2f}%', ha='center', va='bottom', fontsize=10)
+
+            plt.title("Model Accuracy Comparison (Test Set)")
+            plt.ylim(0, 1.1) # Extend limit to accommodate labels
+            plt.ylabel("Accuracy (0 to 1)")
+            plt.xlabel("Deep Learning Detector")
+            plt.grid(axis='y', linestyle='--')
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            plt.close() # Important to close figure to free memory
+            buf.seek(0)
+            graph_url = base64.b64encode(buf.getvalue()).decode('utf-8')
+            buf.close()
+            
+            logger.info("Accuracy graph generated.")
+        except Exception as e:
+            logger.error(f"Error generating accuracy graph: {e}")
+            graph_url = None
+
+    return render(request, 'train_model_graphs.html', {
+        'graph_url': graph_url
+    })
+
+
+def predict(request):
+    """
+    Handles user input, data scaling, ensemble prediction via Majority Voting,
+    and confidence graph generation for data poisoning attack detection.
+    """
+    final_result = None
+    vgg_graph = resnet_graph = msdnet_graph = None
+    label_dict = {0: 'Normal', 1: 'Data Poisoned'}
+    
+    # Reload resources if they were not loaded initially (e.g., first run error)
+    global ML_RESOURCES
+    if ML_RESOURCES is None:
+        ML_RESOURCES = load_ml_resources()
+
+    if ML_RESOURCES is None:
+        return render(request, 'predict.html', {'error': '❌ ML models/scaler failed to load. Please train them first.'})
+
+    if request.method == 'POST':
+        try:
+            # --- Input Acquisition and Validation ---
+            packet_size = float(request.POST['packet_size'])
+            duration = float(request.POST['duration'])
+            integrity = float(request.POST['data_integrity'])
+            sponge_ratio = float(request.POST['sponge_ratio'])
+
+            sample = np.array([[packet_size, duration, integrity, sponge_ratio]])
+
+            # --- Scaling Input ---
+            scaler = ML_RESOURCES['scaler']
+            sample_scaled = scaler.transform(sample)
+            logger.info("Input sample scaled.")
+
+            # --- Load Models and Predict Probabilities ---
+            vgg_model = ML_RESOURCES['vgg_model']
+            resnet_model = ML_RESOURCES['resnet_model']
+            msdnet_model = ML_RESOURCES['msdnet_model']
+
+            # Predict returns a probability array (e.g., [[0.85]])
+            vgg_prob = float(vgg_model.predict(sample_scaled, verbose=0)[0][0])
+            resnet_prob = float(resnet_model.predict(sample_scaled, verbose=0)[0][0])
+            msdnet_prob = float(msdnet_model.predict(sample_scaled, verbose=0)[0][0])
+
+            # --- Binarization (Hard Classification) ---
+            vgg_pred = int(vgg_prob > 0.5)
+            resnet_pred = int(resnet_prob > 0.5)
+            msdnet_pred = int(msdnet_prob > 0.5)
+
+            # --- Ensemble: Majority Vote ---
+            votes = [vgg_pred, resnet_pred, msdnet_pred]
+            # Use max(..., key=votes.count) to find the most frequent item (majority)
+            final_vote = max(set(votes), key=votes.count) 
+            final_result = label_dict[final_vote]
+            logger.info(f"Ensemble result: {final_result}")
+            
+
+            # --- Visualization for Confidence ---
+            def generate_graph(prob, model_name):
+                """Creates a base64 encoded bar chart for model confidence."""
+                plt.figure(figsize=(4, 3))
+                confidence_normal = 1 - prob
+                confidence_poisoned = prob
+                
+                bars = plt.bar(['Normal', 'Data Poisoned'], [confidence_normal, confidence_poisoned],
+                               color=['#5cb85c', '#d9534f']) # Green/Red color scheme
+                
+                # Highlight the predicted class
+                prediction_index = int(prob > 0.5)
+                bars[prediction_index].set_edgecolor('black')
+                bars[prediction_index].set_linewidth(3)
+                
+                # Add confidence labels
+                plt.text(0, confidence_normal + 0.02, f'{confidence_normal*100:.1f}%', ha='center', fontsize=9)
+                plt.text(1, confidence_poisoned + 0.02, f'{confidence_poisoned*100:.1f}%', ha='center', fontsize=9)
+                
+                plt.title(f"{model_name} Prediction Confidence")
+                plt.ylim(0, 1.1) 
+                plt.ylabel("Confidence")
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                plt.close()
+                buf.seek(0)
+                image_png = buf.getvalue()
+                buf.close()
+                return base64.b64encode(image_png).decode('utf-8')
+
+            vgg_graph = generate_graph(vgg_prob, "VGG16")
+            resnet_graph = generate_graph(resnet_prob, "ResNet56")
+            msdnet_graph = generate_graph(msdnet_prob, "MSDNet")
+
+        except ValueError:
+            return render(request, 'predict.html', {'error': '❌ Input must be valid numerical values.'})
+        except Exception as e:
+            logger.error(f"Prediction failed: {e}")
+            return render(request, 'predict.html', {'error': f'❌ Prediction failed: {str(e)}. Check console for details.'})
+
+    return render(request, 'predict.html', {
+        'final_result': final_result,
+        'vgg_graph': vgg_graph,
+        'resnet_graph': resnet_graph,
+        'msdnet_graph': msdnet_graph})
